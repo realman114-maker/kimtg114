@@ -23,8 +23,8 @@ except Exception:
 
 st.set_page_config(page_title="SK브로드밴드 대리점 정산 에이전트", layout="wide")
 
-st.title("📊 SK브로드밴드 대리점 맞춤형 수수료 정산 및 PDF 생성기")
-st.markdown("본사 정산 파일(`.xlsb`)을 업로드하고 관리하시는 **대리점명**을 입력하시면, 개인정보 보호를 위해 **해당 대리점 데이터만 필터링**하고 불필요한 항목을 제외한 **깔끔한 수수료 중심의 PDF 리포트**를 생성합니다.")
+st.title("📊 SK브로드밴드 대리점 정산 및 PDF 리포트 에이전트")
+st.markdown("본사 정산 파일(`.xlsb`)을 업로드하고 관리하시는 **대리점명**을 입력하시면, 개인정보 보호를 위해 타 대리점 정보를 완벽히 차단하고 지정된 대리점의 **'요약' 및 '인센티브' 데이터**만 추출하여 PDF 리포트를 생성합니다.")
 
 # 사용자 입력 영역
 col1, col2 = st.columns(2)
@@ -34,24 +34,41 @@ with col2:
     target_agency = st.text_input("🏢 조회할 대리점명 입력", placeholder="예: 울산중앙대리점")
 
 if uploaded_file is not None and target_agency:
-    if st.button("🚀 정산 데이터 보안 필터링 및 PDF 리포트 생성", type="primary"):
-        with st.spinner("개인정보 보호 필터링 및 리포트 데이터 가공 중..."):
+    if st.button("🚀 보안 필터링 및 PDF 리포트 생성", type="primary"):
+        with st.spinner("개인정보 보호 필터링 및 '요약'/'인센티브' 시트 정밀 분석 중..."):
             try:
                 # 1. pyxlsb를 이용해 xlsb 파일 읽기
                 with open_workbook(uploaded_file) as wb:
                     sheet_names = wb.sheets
+                    st.info(f"📋 파일 내 감지된 시트 목록: {sheet_names}")
+
+                    # 지정된 시트명("요약", "인센티브") 또는 순서에 맞춰 시트 찾기
+                    summary_sheet_name = None
+                    incentive_sheet_name = None
+
+                    for name in sheet_names:
+                        if "요약" in name:
+                            summary_sheet_name = name
+                        elif "인센티브" in name:
+                            incentive_sheet_name = name
+
+                    # 만약 이름 매칭이 안 되면 기본 첫 번째, 두 번째 시트 사용
+                    if not summary_sheet_name and len(sheet_names) > 0:
+                        summary_sheet_name = sheet_names[0]
+                    if not incentive_sheet_name and len(sheet_names) > 1:
+                        incentive_sheet_name = sheet_names[1]
 
                     # 첫 번째 시트 (요약) 읽기
                     data_summary = []
-                    if len(sheet_names) > 0:
-                        with wb.get_sheet(sheet_names[0]) as sheet:
+                    if summary_sheet_name:
+                        with wb.get_sheet(summary_sheet_name) as sheet:
                             for row in sheet.rows():
                                 data_summary.append([item.v for item in row])
 
                     # 두 번째 시트 (인센티브) 읽기
                     data_incentive = []
-                    if len(sheet_names) > 1:
-                        with wb.get_sheet(sheet_names[1]) as sheet:
+                    if incentive_sheet_name:
+                        with wb.get_sheet(incentive_sheet_name) as sheet:
                             for row in sheet.rows():
                                 data_incentive.append([item.v for item in row])
 
@@ -67,22 +84,25 @@ if uploaded_file is not None and target_agency:
                         break
 
                 if agency_col:
-                    # 2. 타 대리점 데이터 차단 및 해당 대리점만 엄격하게 필터링
+                    # 2. 타 대리점 데이터 완벽 차단 및 해당 대리점만 필터링
                     filtered_summary = df_summary[df_summary[agency_col].astype(str).str.strip() == target_agency.strip()]
 
-                    # [선택사항] 수수료/핵심 정산 항목 위주로 최적화 (필요시 제외할 키워드 설정 가능)
-                    # 예: 불필요한 내부 관리용 컬럼이 있다면 여기서 drop() 등으로 제외할 수 있습니다.
-                    
+                    # [선택 최적화] 불필요한 내부 컬럼 제외하고 '수수료 정산 금액' 및 주요 지표 중심 컬럼만 남기기 (필요시 키워드 필터링)
+                    # 예시: 특정 키워드가 포함된 컬럼만 추리고 싶다면 아래 주석을 해제하여 활용 가능
+                    # target_keywords = ["대리점", "수수료", "금액", "정산", "요금", "건수", "인센티브"]
+                    # keep_cols = [c for c in filtered_summary.columns if any(k in str(c) for k in target_keywords)]
+                    # if keep_cols: filtered_summary = filtered_summary[keep_cols]
+
                     st.success(f"🔒 보안 필터링 완료: 타 대리점 정보 차단 및 '{target_agency}' 데이터 추출 성공")
 
                     # 화면 표시: 정산 요약
-                    st.subheader(f"📌 [{target_agency}] 정산 요약 결과")
+                    st.subheader(f"📌 [{target_agency}] 정산 요약 결과 (시트: {summary_sheet_name})")
                     if not filtered_summary.empty:
                         st.dataframe(filtered_summary, use_container_width=True)
                     else:
-                        st.warning(f"'{target_agency}'에 해당하는 정산 요약 데이터를 찾지 못했습니다. 대리점명을 다시 확인해주세요.")
+                        st.warning(f"'{target_agency}'에 해당하는 요약 데이터를 찾지 못했습니다. 대리점명을 다시 확인해주세요.")
 
-                    # 인센티브 시트 필터링 (존재할 경우)
+                    # 인센티브 시트 필터링
                     filtered_incentive = pd.DataFrame()
                     if not df_incentive.empty:
                         inc_agency_col = None
@@ -93,25 +113,24 @@ if uploaded_file is not None and target_agency:
                         if inc_agency_col:
                             filtered_incentive = df_incentive[df_incentive[inc_agency_col].astype(str).str.strip() == target_agency.strip()]
                             if not filtered_incentive.empty:
-                                st.subheader(f"🎁 [{target_agency}] 인센티브 세부 내역")
+                                st.subheader(f"🎁 [{target_agency}] 인센티브 세부 내역 (시트: {incentive_sheet_name})")
                                 st.dataframe(filtered_incentive, use_container_width=True)
 
                     # --- 3. 대리점 배포용 PDF 리포트 생성 로직 ---
                     if not filtered_summary.empty or not filtered_incentive.empty:
                         buffer = io.BytesIO()
-                        # 여백을 주어 깔끔한 문서 레이아웃 구성
                         doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=25, leftMargin=25, topMargin=30, bottomMargin=30)
                         elements = []
 
                         styles = getSampleStyleSheet()
-                        title_style = ParagraphStyle('ReportTitle', parent=styles['Heading1'], fontName=DEFAULT_FONT, fontSize=16, leading=20, textColor=colors.HexColor("#003366"))
-                        heading_style = ParagraphStyle('SectionHeading', parent=styles['Heading2'], fontName=DEFAULT_FONT, fontSize=12, leading=15, spaceBefore=12, spaceAfter=6, textColor=colors.HexColor("#333333"))
-                        cell_style = ParagraphStyle('TableCell', parent=styles['Normal'], fontName=DEFAULT_FONT, fontSize=8, leading=10)
+                        title_style = ParagraphStyle('ReportTitle', parent=styles['Heading1'], fontName=DEFAULT_FONT, fontSize=15, leading=19, textColor=colors.HexColor("#003366"))
+                        heading_style = ParagraphStyle('SectionHeading', parent=styles['Heading2'], fontName=DEFAULT_FONT, fontSize=11, leading=14, spaceBefore=10, spaceAfter=4, textColor=colors.HexColor("#333333"))
+                        cell_style = ParagraphStyle('TableCell', parent=styles['Normal'], fontName=DEFAULT_FONT, fontSize=7.5, leading=9.5)
 
-                        # 문서 타이틀 (SK브로드밴드 공식 배포 느낌)
+                        # 문서 타이틀
                         elements.append(Paragraph(f"SK브로드밴드 대리점 수수료 정산 리포트", title_style))
-                        elements.append(Paragraph(f"<b>대상 대리점:</b> {target_agency}", ParagraphStyle('SubTitle', parent=styles['Normal'], fontName=DEFAULT_FONT, fontSize=10, leading=14, spaceAfter=10)))
-                        elements.append(Spacer(1, 5))
+                        elements.append(Paragraph(f"<b>대상 대리점:</b> {target_agency}", ParagraphStyle('SubTitle', parent=styles['Normal'], fontName=DEFAULT_FONT, fontSize=9.5, leading=13, spaceAfter=8)))
+                        elements.append(Spacer(1, 4))
 
                         # 1. 요약 테이블 추가
                         if not filtered_summary.empty:
@@ -125,12 +144,12 @@ if uploaded_file is not None and target_agency:
                                 ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
                                 ('ALIGN', (0,0), (-1,-1), 'CENTER'),
                                 ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-                                ('BOTTOMPADDING', (0,0), (-1,0), 5),
-                                ('TOPPADDING', (0,0), (-1,0), 5),
+                                ('BOTTOMPADDING', (0,0), (-1,0), 4),
+                                ('TOPPADDING', (0,0), (-1,0), 4),
                                 ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#CCCCCC"))
                             ]))
                             elements.append(t_sum)
-                            elements.append(Spacer(1, 10))
+                            elements.append(Spacer(1, 8))
 
                         # 2. 인센티브 테이블 추가
                         if not filtered_incentive.empty:
@@ -144,8 +163,8 @@ if uploaded_file is not None and target_agency:
                                 ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
                                 ('ALIGN', (0,0), (-1,-1), 'CENTER'),
                                 ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-                                ('BOTTOMPADDING', (0,0), (-1,0), 5),
-                                ('TOPPADDING', (0,0), (-1,0), 5),
+                                ('BOTTOMPADDING', (0,0), (-1,0), 4),
+                                ('TOPPADDING', (0,0), (-1,0), 4),
                                 ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#CCCCCC"))
                             ]))
                             elements.append(t_inc)
@@ -163,7 +182,7 @@ if uploaded_file is not None and target_agency:
                             type="primary"
                         )
                 else:
-                    st.error("본사 정산 파일의 요약 시트에서 '대리점' 관련 컬럼을 찾을 수 없습니다. 컬럼명을 확인해 주세요.")
+                    st.error("요약 시트에서 '대리점' 관련 컬럼을 찾을 수 없습니다. 컬럼명을 확인해 주세요.")
 
             except Exception as e:
                 st.error(f"데이터 처리 중 오류가 발생했습니다: {e}")
