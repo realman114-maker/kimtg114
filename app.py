@@ -167,5 +167,3 @@ if uploaded_file is not None and target_agency:
 
             except Exception as e:
                 st.error(f"데이터 처리 중 오류가 발생했습니다: {e}")
-
-<FollowUp>생성된 에이전트 코드를 활용하시면서 추가로 대리점별 정산 금액 합계나 특정 항목 자동 계산 기능 등 더 보완하고 싶은 실무 요구사항이 있으신가요?</FollowUp>
