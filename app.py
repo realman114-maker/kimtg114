@@ -24,7 +24,7 @@ from reportlab.platypus import (PageBreak, Paragraph, SimpleDocTemplate,
 # 예) MY_AGENCIES = ["베스트원", "파트너", "SN네트워크"]
 MY_AGENCIES = []
 
-# PDF '개통 상세' 표에 보여줄 열 (2번째 시트 기준, 없는 열/전부 공란인 열은 자동 제외)
+# PDF '개통 상세' 표에 보여줄 열 (상세 시트 기준, 없는 열/전부 공란인 열은 자동 제외)
 DETAIL_COLUMNS = [
     "개통일자", "서비스관리번호", "고객명", "요금상품", "약정할인개월명",
     "번들유형구분명", "시군구명", "사은품합계금액", "추정_인센티브(본사)", "해지일",
@@ -47,17 +47,41 @@ def _engine(filename):
     return "pyxlsb" if filename.lower().endswith(".xlsb") else None
 
 
-def _parse_sheet(xl, idx):
-    """시트를 읽어 '대리점명' 헤더 행을 자동으로 찾고 (DataFrame, 그룹 라벨 dict)를 돌려준다."""
-    raw = xl.parse(sheet_name=idx, header=None)
-    hdr = None
+def _header_row(raw):
+    """위에서 20행 안에서 '대리점명' 헤더가 있는 행 번호를 찾는다. 없으면 None."""
     for i in range(min(20, len(raw))):
         vals = [_clean(v) for v in raw.iloc[i].tolist() if pd.notna(v)]
         if "대리점명" in vals:
-            hdr = i
-            break
+            return i
+    return None
+
+
+def _find_sheets(xl):
+    """사용할 시트 2개(요약, 인센티브 상세)의 위치를 찾는다.
+    1) 시트 이름이 '요약' / '인센티브...'로 시작하는 시트를 우선 사용
+    2) 없으면 '대리점명' 헤더가 있는 앞쪽 시트 2개를 사용
+    (월·상품에 따라 맨 앞에 '수정사항' 같은 시트가 끼어 있어도 동작하도록 이름 기준으로 찾음)"""
+    names = [str(n).strip() for n in xl.sheet_names]
+    s_idx = next((i for i, n in enumerate(names) if n == "요약"), None)
+    d_idx = next((i for i, n in enumerate(names) if n.startswith("인센티브")), None)
+    if s_idx is not None and d_idx is not None:
+        return s_idx, d_idx
+    found = []
+    for i in range(len(names)):
+        raw = xl.parse(sheet_name=i, header=None, nrows=20)
+        if _header_row(raw) is not None:
+            found.append(i)
+        if len(found) == 2:
+            return found[0], found[1]
+    raise ValueError("'대리점명' 헤더가 있는 시트 2개를 찾지 못했습니다. 시트 목록: " + ", ".join(names[:12]))
+
+
+def _parse_sheet(xl, idx):
+    """시트를 읽어 '대리점명' 헤더 행을 자동으로 찾고 (DataFrame, 그룹 라벨 dict)를 돌려준다."""
+    raw = xl.parse(sheet_name=idx, header=None)
+    hdr = _header_row(raw)
     if hdr is None:
-        raise ValueError(f"{idx + 1}번째 시트에서 '대리점명' 헤더를 찾지 못했습니다.")
+        raise ValueError(f"'{xl.sheet_names[idx]}' 시트에서 '대리점명' 헤더를 찾지 못했습니다.")
 
     names, seen = [], {}
     for j, v in enumerate(raw.iloc[hdr].tolist()):
@@ -88,9 +112,10 @@ def _parse_sheet(xl, idx):
 @st.cache_data(show_spinner="파일을 읽는 중입니다...")
 def load_workbook(data, filename):
     xl = pd.ExcelFile(io.BytesIO(data), engine=_engine(filename))
-    sheet_names = xl.sheet_names[:2]
-    summary, groups = _parse_sheet(xl, 0)
-    detail, _ = _parse_sheet(xl, 1)
+    s_idx, d_idx = _find_sheets(xl)
+    sheet_names = [xl.sheet_names[s_idx], xl.sheet_names[d_idx]]
+    summary, groups = _parse_sheet(xl, s_idx)
+    detail, _ = _parse_sheet(xl, d_idx)
 
     # 그룹 라벨(본사/담당/영업팀)이 없으면 숫자 열 전체를 하나의 그룹으로 취급
     if not any(groups.get(c) for c in summary.columns if c not in ID_COLS):
@@ -476,7 +501,7 @@ def main():
     st.title("📄 대리점 수수료 정산 에이전트")
     if not check_password():
         return
-    st.caption("본사 정산마스터 파일에서 담당 대리점만 골라 PDF 표와 분석 리포트로 정리합니다. (1·2번째 시트만 사용)")
+    st.caption("본사 정산마스터 파일에서 담당 대리점만 골라 PDF 표와 분석 리포트로 정리합니다. ('요약'·'인센티브' 시트만 사용)")
 
     up = st.file_uploader("정산마스터 파일 업로드 (xlsb / xlsx)", type=["xlsb", "xlsx"])
     if up is None:
