@@ -1,4 +1,6 @@
-streamlit
-pandas
+streamlit>=1.37
+pandas>=2.0
+numpy
 pyxlsb
+openpyxl
 reportlab
