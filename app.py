@@ -1,4 +1,28 @@
+# -*- coding: utf-8 -*-
+"""
+대리점 수수료 정산 에이전트 (Streamlit)
+
+본사에서 매월 받는 '지역_정산마스터' 파일(xlsb/xlsx)에서
+  - '요약' 시트(대리점별 요약)와 '인센티브' 시트(개통 건별 상세)만 사용하고
+  - 담당 대리점(대리점명 기준)만 필터링한 뒤
+  - 공란(필요하면 0 포함) 항목을 제거하여
+  - 표 형식 PDF + 분석 리포트 + 엑셀 파일로 내려받을 수 있게 합니다.
+
+[공유해서 쓰는 방법]
+  관리자가 정산 파일을 한 번 올려 '공유용으로 저장'하면, 접속 코드를 받은 사람은
+  파일 업로드 없이 자기 담당 대리점만 골라 PDF/엑셀을 받을 수 있습니다.
+  Streamlit secrets 예시:
+      ADMIN_PASSWORD = "관리자용-비밀번호"
+      [USERS]
+      "1234" = ["베스트원", "파트너"]
+      "5678" = ["SN네트워크"]
+  secrets를 설정하지 않으면 기존처럼 개인용(업로드해서 바로 사용)으로 동작합니다.
+
+실행:  streamlit run app.py
+"""
+import hmac
 import io
+import json
 import os
 import re
 from datetime import datetime
@@ -31,6 +55,10 @@ DETAIL_COLUMNS = [
 ]
 # 개통 상세 표 맨 아래에 합계를 낼 열
 DETAIL_SUM_COLUMNS = ["사은품합계금액", "추정_인센티브(본사)"]
+
+# 공유용으로 저장한 정산 파일이 놓일 폴더 (영구 저장되는 디스크 경로로 바꿀 수 있음)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("SETTLEMENT_DATA_DIR", os.path.join(BASE_DIR, "shared_data"))
 
 ID_COLS = {"센터명", "대리점명", "合", "합", "합계"}
 NO_COMMA_HINTS = ("코드", "번호", "ID", "id")
@@ -171,6 +199,27 @@ def build_items(summary_f, groups, drop_zero):
     return pd.DataFrame(rows, columns=["대리점명", "구분", "항목", "금액"])
 
 
+def item_detail(detail_f, agency, item):
+    """정산 항목 1개에 해당하는 개통 건별 내역을 돌려준다.
+    요약 시트의 정산 항목 열은 개통 상세 시트의 같은 이름 열을 대리점별로 합산한 값이므로,
+    해당 열의 값이 0/공란이 아닌 건만 추려서 보여준다.
+    반환: (표시용 DataFrame, 건별 합계, 건수)  /  상세 시트에 같은 이름의 열이 없으면 None"""
+    if item not in detail_f.columns:
+        return None
+    d = detail_f[detail_f["대리점명"] == agency]
+    amt = pd.to_numeric(d[item], errors="coerce").fillna(0)
+    keep = amt != 0
+    d, amt = d[keep], amt[keep]
+    if "개통일자" in d.columns:
+        order = d["개통일자"].sort_values().index
+        d, amt = d.loc[order], amt.loc[order]
+    cols = [c for c in DETAIL_COLUMNS
+            if c in d.columns and c not in DETAIL_SUM_COLUMNS and d[c].notna().any()]
+    out = pd.DataFrame({c: [fmt_cell(c, v) for v in d[c]] for c in cols})
+    out["해당 항목 금액"] = [won(v) for v in amt]
+    return out, float(amt.sum()), len(d)
+
+
 # ─────────────────────────────────────────────────────────────
 # 서식 도우미
 # ─────────────────────────────────────────────────────────────
@@ -287,7 +336,6 @@ def make_analysis(totals_all, totals_sel, order, items, detail_f):
 # ─────────────────────────────────────────────────────────────
 # PDF 생성
 # ─────────────────────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HEADER_BG = colors.HexColor("#1F3A5F")
 ZEBRA = colors.HexColor("#F3F5F8")
 LINE = colors.HexColor("#C9CFD8")
@@ -475,41 +523,174 @@ def build_excel(totals_sel, items, summary_f, detail_f):
 
 
 # ─────────────────────────────────────────────────────────────
-# 화면
+# 접근 제어 (공유용)
 # ─────────────────────────────────────────────────────────────
-def check_password():
+def _secret(key, default=None):
     try:
-        pw = st.secrets.get("APP_PASSWORD")
+        return st.secrets.get(key, default)
     except Exception:
-        pw = None
-    if not pw:
-        return True
-    if st.session_state.get("authed"):
-        return True
-    typed = st.text_input("비밀번호", type="password")
-    if typed:
-        if typed == pw:
-            st.session_state["authed"] = True
+        return default
+
+
+def _norm_agencies(v):
+    if isinstance(v, str):
+        v = v.strip()
+        return ["*"] if v == "*" else [v]
+    return [str(x).strip() for x in v]
+
+
+def get_access_config():
+    """secrets에서 관리자 비밀번호(ADMIN_PASSWORD)와 사용자별 접속 코드(USERS)를 읽는다."""
+    admin = _secret("ADMIN_PASSWORD")
+    admin = str(admin) if admin else ""
+    users = {}
+    raw = _secret("USERS")
+    if raw:
+        try:
+            for code, ags in dict(raw).items():
+                users[str(code)] = _norm_agencies(ags)
+        except Exception:
+            users = {}
+    return admin, users
+
+
+def _same(a, b):
+    return hmac.compare_digest(str(a).encode("utf-8"), str(b).encode("utf-8"))
+
+
+def match_code(code, admin, users):
+    """접속 코드로 권한을 판정한다. 관리자는 전체 대리점, 사용자는 지정된 대리점만."""
+    if admin and _same(code, admin):
+        return {"role": "admin", "agencies": None}
+    for c, ags in users.items():
+        if _same(code, c):
+            return {"role": "user", "agencies": None if "*" in ags else set(ags)}
+    return None
+
+
+def login():
+    admin, users = get_access_config()
+    if not admin and not users:
+        return {"role": "open", "agencies": None}  # 비밀번호 미설정: 개인용(기존 방식)
+    if st.session_state.get("auth"):
+        return st.session_state["auth"]
+    code = st.text_input("접속 코드", type="password")
+    if code:
+        auth = match_code(code, admin, users)
+        if auth:
+            st.session_state["auth"] = auth
             st.rerun()
         else:
-            st.error("비밀번호가 올바르지 않습니다.")
-    return False
+            st.error("접속 코드가 올바르지 않습니다.")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+# 공유용 파일 저장/불러오기
+# ─────────────────────────────────────────────────────────────
+def _shared_paths():
+    return os.path.join(DATA_DIR, "latest.bin"), os.path.join(DATA_DIR, "latest.json")
+
+
+def save_shared(data, filename):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    bin_p, meta_p = _shared_paths()
+    tmp = bin_p + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, bin_p)
+    meta = {"filename": filename, "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M")}
+    with open(meta_p, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False)
+
+
+def read_shared():
+    """저장된 공유 파일을 (바이트, 파일명, 저장시각)으로 돌려준다. 없으면 None."""
+    bin_p, meta_p = _shared_paths()
+    try:
+        if not (os.path.exists(bin_p) and os.path.exists(meta_p)):
+            return None
+        with open(meta_p, encoding="utf-8") as f:
+            meta = json.load(f)
+        with open(bin_p, "rb") as f:
+            data = f.read()
+        return data, meta.get("filename", "shared.xlsx"), meta.get("saved_at", "")
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
+# 화면
+# ─────────────────────────────────────────────────────────────
+def show_item_detail(agency, group, item, amount, detail_f):
+    """선택한 정산 항목의 개통 건별 세부내역을 화면에 보여준다."""
+    st.divider()
+    st.subheader(f"{agency} · {item}")
+    res = item_detail(detail_f, agency, item)
+    if res is None:
+        st.info("이 항목은 개통 상세 시트에 같은 이름의 열이 없어 건별 내역을 표시할 수 없습니다. (요약 시트에만 있는 항목)")
+        return
+    out, total, n = res
+    st.caption(f"구분: {group}  ·  해당 건수 {n:,}건  ·  건별 합계 {won(total)}원")
+    if abs(total - amount) < 1:
+        st.success(f"요약 시트의 금액({won(amount)}원)과 건별 합계가 일치합니다.")
+    else:
+        st.warning(f"요약 시트 금액({won(amount)}원)과 건별 합계({won(total)}원)가 다릅니다. 차이 {won(total - amount)}원")
+    if n == 0:
+        st.info("금액이 있는 개통 건이 없습니다. (대리점 단위로만 반영된 항목일 수 있습니다)")
+        return
+    st.dataframe(out, use_container_width=True, hide_index=True)
+    safe = re.sub(r'[\\/:*?"<>|\[\]]', "_", f"{agency}_{item}")
+    st.download_button("⬇️ 이 항목 세부내역 CSV", out.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{safe}.csv", mime="text/csv", key=f"dl_{safe}")
 
 
 def main():
     st.set_page_config(page_title="대리점 정산 에이전트", page_icon="📄", layout="wide")
     st.title("📄 대리점 수수료 정산 에이전트")
-    if not check_password():
+
+    auth = login()
+    if auth is None:
         return
+    role, allowed = auth["role"], auth["agencies"]
+    if role != "open":
+        with st.sidebar:
+            st.write("권한: " + ("관리자" if role == "admin" else "사용자"))
+            if st.button("로그아웃"):
+                st.session_state.pop("auth", None)
+                st.session_state.pop("pdf", None)
+                st.rerun()
+
     st.caption("본사 정산마스터 파일에서 담당 대리점만 골라 PDF 표와 분석 리포트로 정리합니다. ('요약'·'인센티브' 시트만 사용)")
 
-    up = st.file_uploader("정산마스터 파일 업로드 (xlsb / xlsx)", type=["xlsb", "xlsx"])
-    if up is None:
-        st.info("파일을 올리면 시작합니다.")
+    # ── 파일 준비: 관리자/개인은 업로드, 사용자는 저장된 공유 파일 사용
+    shared = read_shared()
+    up = None
+    if role in ("admin", "open"):
+        title = "📤 정산마스터 파일 업로드" + (" / 공유용 교체" if role == "admin" else "")
+        with st.expander(title, expanded=(shared is None)):
+            up = st.file_uploader("정산마스터 파일 (xlsb / xlsx)", type=["xlsb", "xlsx"])
+            if up is not None and role == "admin":
+                st.caption("저장하면 접속 코드를 받은 사용자가 파일 업로드 없이 이 파일을 사용합니다.")
+                if st.button("공유용으로 저장"):
+                    try:
+                        save_shared(up.getvalue(), up.name)
+                        shared = read_shared()
+                        st.success("공유용으로 저장했습니다.")
+                    except Exception as e:
+                        st.error(f"저장하지 못했습니다: {e}")
+
+    if up is not None:
+        data, src_name, saved_at = up.getvalue(), up.name, "방금 업로드"
+    elif shared:
+        data, src_name, saved_at = shared
+    else:
+        st.info("관리자가 아직 정산 파일을 올리지 않았습니다." if role == "user" else "파일을 올리면 시작합니다.")
         return
+    st.caption(f"사용 중인 파일: {src_name} ({saved_at})")
 
     try:
-        summary, groups, detail, sheet_names = load_workbook(up.getvalue(), up.name)
+        summary, groups, detail, sheet_names = load_workbook(data, src_name)
     except ImportError:
         st.error("xlsb를 읽으려면 pyxlsb가 필요합니다. requirements.txt에 pyxlsb가 있는지 확인해 주세요.")
         return
@@ -519,14 +700,19 @@ def main():
 
     st.success(f"읽기 완료 · 사용 시트: {' / '.join(sheet_names)} · 요약 {len(summary):,}행, 개통 상세 {len(detail):,}행")
 
-    agencies = list(dict.fromkeys(list(summary["대리점명"]) + list(detail["대리점명"])))
-    default = [a for a in MY_AGENCIES if a in agencies]
+    # ── 대리점 선택 (사용자 권한이면 허용된 대리점만 노출)
+    agencies_all = list(dict.fromkeys(list(summary["대리점명"]) + list(detail["대리점명"])))
+    agencies = agencies_all if allowed is None else [a for a in agencies_all if a in allowed]
+    if not agencies:
+        st.error("선택할 수 있는 대리점이 없습니다. 접속 코드에 지정된 대리점명이 이번 파일에 있는지 관리자에게 확인해 주세요.")
+        return
+    default = agencies if role == "user" else [a for a in MY_AGENCIES if a in agencies]
     c1, c2, c3 = st.columns([3, 1, 1])
     picked = c1.multiselect("담당 대리점 (대리점명 기준)", agencies, default=default)
     drop_zero = c2.checkbox("0원 항목도 제외", value=True)
     include_detail = c3.checkbox("PDF에 개통 상세 포함", value=True)
     if not picked:
-        st.warning("담당 대리점을 선택해 주세요. (app.py 상단 MY_AGENCIES에 적어두면 자동 선택됩니다)")
+        st.warning("대리점을 선택해 주세요." + (" (app.py 상단 MY_AGENCIES에 적어두면 자동 선택됩니다)" if role != "user" else ""))
         return
 
     totals_all, order = agency_totals(summary, groups)
@@ -556,25 +742,49 @@ def main():
             for ln in lines:
                 st.markdown(("&nbsp;&nbsp;&nbsp;&nbsp;" if ln.startswith("  ") else "- ") + ln.strip())
     with t3:
-        show = items.copy()
+        ag_pick = "전체"
+        if len(totals_sel) > 1:
+            ag_pick = st.selectbox("대리점 보기", ["전체"] + list(totals_sel["대리점명"]))
+        view = items if ag_pick == "전체" else items[items["대리점명"] == ag_pick]
+        view = view.reset_index(drop=True)
+        show = view.copy()
         show["금액"] = show["금액"].map(won)
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption("표에서 정산 항목 행을 클릭하면 아래에 개통 건별 세부내역이 나옵니다.")
+        chosen = None
+        tbl_key = f"items_tbl_{abs(hash((ag_pick, tuple(picked), drop_zero, src_name)))}"
+        try:
+            ev = st.dataframe(show, use_container_width=True, hide_index=True,
+                              on_select="rerun", selection_mode="single-row", key=tbl_key)
+            rows = list(getattr(getattr(ev, "selection", None), "rows", []) or [])
+            if rows and rows[0] < len(view):
+                chosen = view.iloc[rows[0]]
+        except TypeError:  # 행 선택을 지원하지 않는 구버전 Streamlit: 선택 상자로 대체
+            st.dataframe(show, use_container_width=True, hide_index=True)
+            labels = [f"{r['대리점명']} | {r['항목']}" for _, r in view.iterrows()]
+            pick = st.selectbox("세부내역을 볼 항목", ["선택 안 함"] + labels)
+            if pick != "선택 안 함":
+                chosen = view.iloc[labels.index(pick)]
+        if chosen is not None:
+            show_item_detail(chosen["대리점명"], chosen["구분"], chosen["항목"], float(chosen["금액"]), detail_f)
     with t4:
         cols = [c for c in DETAIL_COLUMNS if c in detail_f.columns and detail_f[c].notna().any()]
         show = pd.DataFrame({c: [fmt_cell(c, v) for v in detail_f[c]] for c in ["대리점명"] + cols})
         st.dataframe(show, use_container_width=True, hide_index=True)
 
     st.divider()
-    meta = {"month": month_label(up.name), "created": datetime.now().strftime("%Y-%m-%d"),
+    meta = {"month": month_label(src_name), "created": datetime.now().strftime("%Y-%m-%d"),
             "hq": ""}
     if "본부명" in detail_f.columns and detail_f["본부명"].notna().any():
         meta["hq"] = str(detail_f["본부명"].mode().iloc[0])
 
+    # 선택 조건이 바뀌면 이전에 만든 PDF는 다시 만들도록 서명으로 구분
+    sig = (tuple(picked), drop_zero, include_detail, src_name, saved_at)
     b1, b2 = st.columns(2)
     if b1.button("PDF 리포트 만들기", type="primary"):
         with st.spinner("PDF를 만드는 중입니다..."):
             st.session_state["pdf"] = build_pdf(meta, totals_sel, order, items, detail_f, sections, include_detail)
-    if st.session_state.get("pdf"):
+            st.session_state["pdf_sig"] = sig
+    if st.session_state.get("pdf") and st.session_state.get("pdf_sig") == sig:
         fname = f"대리점정산_{meta['month'] or datetime.now().strftime('%Y%m')}.pdf".replace(" ", "")
         b1.download_button("⬇️ PDF 내려받기", st.session_state["pdf"], file_name=fname, mime="application/pdf")
 
