@@ -18,13 +18,23 @@
       "5678" = ["SN네트워크"]
   secrets를 설정하지 않으면 기존처럼 개인용(업로드해서 바로 사용)으로 동작합니다.
 
+[보안]
+  - 이 앱은 외부 서버·API로 데이터를 보내지 않습니다. 파일은 앱이 실행되는 서버 안에서만 처리됩니다.
+  - 개인용: 업로드한 파일은 디스크에 저장되지 않고 접속(세션) 메모리에서만 처리되며,
+    업로드 파일을 지우거나 로그아웃/접속 종료하면 폐기됩니다. (서버 전체 공용 캐시도 쓰지 않음)
+  - 공유용: 관리자가 저장한 파일만 서버 폴더에 놓이며, '공유 파일 삭제' 버튼(덮어쓰기 후 삭제)이나
+    자동 만료(SHARED_RETENTION_HOURS)로 서버에서 지워집니다.
+
 실행:  streamlit run app.py
 """
+import gc
+import hashlib
 import hmac
 import io
 import json
 import os
 import re
+import time
 from datetime import datetime
 from xml.sax.saxutils import escape
 
@@ -55,6 +65,11 @@ DETAIL_COLUMNS = [
 ]
 # 개통 상세 표 맨 아래에 합계를 낼 열
 DETAIL_SUM_COLUMNS = ["사은품합계금액", "추정_인센티브(본사)"]
+
+# 공유용으로 저장한 파일을 자동 삭제할 때까지의 시간(시간 단위). 0이면 자동 삭제 안 함
+SHARED_RETENTION_HOURS = 168  # 7일
+# False면 '사용자' 권한은 화면 조회만 가능 (PDF·엑셀·CSV 내려받기 제한). 관리자·개인용은 항상 가능
+ALLOW_USER_DOWNLOADS = True
 
 # 공유용으로 저장한 정산 파일이 놓일 폴더 (영구 저장되는 디스크 경로로 바꿀 수 있음)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -137,7 +152,6 @@ def _parse_sheet(xl, idx):
     return df, groups
 
 
-@st.cache_data(show_spinner="파일을 읽는 중입니다...")
 def load_workbook(data, filename):
     xl = pd.ExcelFile(io.BytesIO(data), engine=_engine(filename))
     s_idx, d_idx = _find_sheets(xl)
@@ -150,6 +164,31 @@ def load_workbook(data, filename):
         groups = {c: "정산항목" for c in summary.columns
                   if c not in ID_COLS and pd.api.types.is_numeric_dtype(summary[c])}
     return summary, groups, detail, sheet_names
+
+
+def load_workbook_session(data, filename):
+    """파싱 결과를 '이 접속(세션)'에만 보관한다. 서버 전체 공용 캐시를 쓰지 않으므로
+    파일을 지우거나 접속이 끝나면 함께 사라진다."""
+    key = hashlib.sha256(data).hexdigest()
+    cached = st.session_state.get("_parsed")
+    if cached and cached[0] == key:
+        return cached[1]
+    with st.spinner("파일을 읽는 중입니다..."):
+        result = load_workbook(data, filename)
+    st.session_state["_parsed"] = (key, result)
+    return result
+
+
+def purge_session_data():
+    """이 접속에 남아 있는 가공 데이터(파싱 결과, PDF, 표 선택 상태)를 모두 폐기한다."""
+    for k in list(st.session_state.keys()):
+        name = str(k)
+        if name in ("_parsed", "pdf", "pdf_sig") or name.startswith(("items_tbl_", "dl_")):
+            try:
+                st.session_state.pop(k, None)
+            except Exception:
+                pass
+    gc.collect()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -592,26 +631,64 @@ def _shared_paths():
     return os.path.join(DATA_DIR, "latest.bin"), os.path.join(DATA_DIR, "latest.json")
 
 
+def _wipe(path):
+    """파일 내용을 0으로 덮어쓴 뒤 삭제한다. 파일이 없으면 무시."""
+    try:
+        left = os.path.getsize(path)
+        chunk = b"\0" * (1 << 20)
+        with open(path, "r+b") as f:
+            while left > 0:
+                n = min(left, len(chunk))
+                f.write(chunk[:n])
+                left -= n
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def delete_shared():
+    """서버에 저장된 공유 파일과 메타 정보를 덮어쓰기 후 삭제한다."""
+    bin_p, meta_p = _shared_paths()
+    for p in (bin_p, meta_p, bin_p + ".tmp"):
+        _wipe(p)
+
+
 def save_shared(data, filename):
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
     bin_p, meta_p = _shared_paths()
     tmp = bin_p + ".tmp"
-    with open(tmp, "wb") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # 소유자만 읽기/쓰기
+    with os.fdopen(fd, "wb") as f:
         f.write(data)
+    _wipe(bin_p)  # 이전 파일은 덮어써서 지운 뒤 교체
     os.replace(tmp, bin_p)
-    meta = {"filename": filename, "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M")}
+    meta = {"filename": filename, "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "saved_ts": time.time()}
     with open(meta_p, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False)
+    try:
+        os.chmod(meta_p, 0o600)
+    except OSError:
+        pass
 
 
 def read_shared():
-    """저장된 공유 파일을 (바이트, 파일명, 저장시각)으로 돌려준다. 없으면 None."""
+    """저장된 공유 파일을 (바이트, 파일명, 저장시각)으로 돌려준다. 없거나 보관 기간이 지났으면 None."""
     bin_p, meta_p = _shared_paths()
     try:
         if not (os.path.exists(bin_p) and os.path.exists(meta_p)):
             return None
         with open(meta_p, encoding="utf-8") as f:
             meta = json.load(f)
+        ts = float(meta.get("saved_ts") or os.path.getmtime(bin_p))
+        if SHARED_RETENTION_HOURS and time.time() - ts > SHARED_RETENTION_HOURS * 3600:
+            delete_shared()  # 보관 기간이 지나면 자동 삭제
+            return None
         with open(bin_p, "rb") as f:
             data = f.read()
         return data, meta.get("filename", "shared.xlsx"), meta.get("saved_at", "")
@@ -622,7 +699,7 @@ def read_shared():
 # ─────────────────────────────────────────────────────────────
 # 화면
 # ─────────────────────────────────────────────────────────────
-def show_item_detail(agency, group, item, amount, detail_f):
+def show_item_detail(agency, group, item, amount, detail_f, can_download=True):
     """선택한 정산 항목의 개통 건별 세부내역을 화면에 보여준다."""
     st.divider()
     st.subheader(f"{agency} · {item}")
@@ -640,9 +717,10 @@ def show_item_detail(agency, group, item, amount, detail_f):
         st.info("금액이 있는 개통 건이 없습니다. (대리점 단위로만 반영된 항목일 수 있습니다)")
         return
     st.dataframe(out, use_container_width=True, hide_index=True)
-    safe = re.sub(r'[\\/:*?"<>|\[\]]', "_", f"{agency}_{item}")
-    st.download_button("⬇️ 이 항목 세부내역 CSV", out.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"{safe}.csv", mime="text/csv", key=f"dl_{safe}")
+    if can_download:
+        safe = re.sub(r'[\\/:*?"<>|\[\]]', "_", f"{agency}_{item}")
+        st.download_button("⬇️ 이 항목 세부내역 CSV", out.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"{safe}.csv", mime="text/csv", key=f"dl_{safe}")
 
 
 def main():
@@ -657,11 +735,12 @@ def main():
         with st.sidebar:
             st.write("권한: " + ("관리자" if role == "admin" else "사용자"))
             if st.button("로그아웃"):
+                purge_session_data()
                 st.session_state.pop("auth", None)
-                st.session_state.pop("pdf", None)
                 st.rerun()
 
     st.caption("본사 정산마스터 파일에서 담당 대리점만 골라 PDF 표와 분석 리포트로 정리합니다. ('요약'·'인센티브' 시트만 사용)")
+    can_download = role != "user" or ALLOW_USER_DOWNLOADS
 
     # ── 파일 준비: 관리자/개인은 업로드, 사용자는 저장된 공유 파일 사용
     shared = read_shared()
@@ -679,18 +758,35 @@ def main():
                         st.success("공유용으로 저장했습니다.")
                     except Exception as e:
                         st.error(f"저장하지 못했습니다: {e}")
+            if role == "admin" and shared:
+                st.caption(f"현재 공유 중인 파일: {shared[1]} (저장 {shared[2]})")
+                confirm = st.checkbox("공유 파일을 서버에서 삭제하는 것에 동의합니다.")
+                if st.button("공유 파일 삭제", disabled=not confirm):
+                    delete_shared()
+                    purge_session_data()
+                    shared = None
+                    st.success("서버에서 삭제했습니다. 다른 사용자는 다음 조작부터 이 파일을 쓸 수 없습니다.")
+
+    # 업로드 파일을 지우면(업로드 창의 X) 이 접속에 남은 가공 데이터도 함께 폐기
+    if up is not None:
+        st.session_state["_had_upload"] = True
+    elif st.session_state.pop("_had_upload", False):
+        purge_session_data()
 
     if up is not None:
         data, src_name, saved_at = up.getvalue(), up.name, "방금 업로드"
     elif shared:
         data, src_name, saved_at = shared
     else:
+        purge_session_data()
         st.info("관리자가 아직 정산 파일을 올리지 않았습니다." if role == "user" else "파일을 올리면 시작합니다.")
         return
     st.caption(f"사용 중인 파일: {src_name} ({saved_at})")
+    if up is not None:
+        st.caption("🔒 업로드한 파일은 디스크에 저장되지 않고 이 접속의 메모리에서만 처리됩니다. 파일을 지우거나 로그아웃·접속 종료 시 폐기됩니다.")
 
     try:
-        summary, groups, detail, sheet_names = load_workbook(data, src_name)
+        summary, groups, detail, sheet_names = load_workbook_session(data, src_name)
     except ImportError:
         st.error("xlsb를 읽으려면 pyxlsb가 필요합니다. requirements.txt에 pyxlsb가 있는지 확인해 주세요.")
         return
@@ -765,13 +861,16 @@ def main():
             if pick != "선택 안 함":
                 chosen = view.iloc[labels.index(pick)]
         if chosen is not None:
-            show_item_detail(chosen["대리점명"], chosen["구분"], chosen["항목"], float(chosen["금액"]), detail_f)
+            show_item_detail(chosen["대리점명"], chosen["구분"], chosen["항목"], float(chosen["금액"]), detail_f, can_download)
     with t4:
         cols = [c for c in DETAIL_COLUMNS if c in detail_f.columns and detail_f[c].notna().any()]
         show = pd.DataFrame({c: [fmt_cell(c, v) for v in detail_f[c]] for c in ["대리점명"] + cols})
         st.dataframe(show, use_container_width=True, hide_index=True)
 
     st.divider()
+    if not can_download:
+        st.info("이 계정은 화면 조회만 가능합니다. (PDF·엑셀·CSV 내려받기 제한)")
+        return
     meta = {"month": month_label(src_name), "created": datetime.now().strftime("%Y-%m-%d"),
             "hq": ""}
     if "본부명" in detail_f.columns and detail_f["본부명"].notna().any():
